@@ -1,41 +1,25 @@
 """
-GridLock — Traffic Demand Prediction Pipeline (v7)
-==================================================
-Implements the documented breakthrough that the previous `solution.py` (now
-preserved as `solution_v1_baseline.py`) never actually contained: the naive
-baseline trained on the full 77k mixed-population training set and was capped at
-~91 LB by a training/test distribution mismatch.
+GridLock — Traffic Demand Prediction Pipeline (v8: robust ensemble on the
+proven full-train baseline)
+============================================================================
+HISTORY / WHY THIS DESIGN
+-------------------------
+The full-train LightGBM baseline (preserved as `solution_v1_baseline.py`) scored
+**91.22** on the real leaderboard. A later "d49-only + fancy features" rewrite
+scored higher on local OOF but **dropped to 88.89 / 88.28 on the real LB** — it
+overfit a leaky, night-only signal. Lesson, confirmed by a leakage-aware local
+harness (`research_cv.py`): on this dataset, **simple + leak-free generalizes;
+high-cardinality per-geohash time encodings (gh×mod, gh×hour) silently leak the
+target and collapse on the held-out daytime block** (block-holdout R² 0.88 → 0.43).
 
-This version trains the demand model on the *correct* population — the day-49
-rows only — using leakage-free cross-day features anchored on the day-48 history.
-
-Why d49-only?
--------------
-  Test  = day-49 daytime (mod 135-825), predicted from day-48 history.
-  d49 train rows (mod 0-120) are the only rows whose features (d48 lookups) are a
-  GENUINE cross-day signal AND whose task matches the test task. d48 rows leak
-  (their d48[gh,mod] lookup == their own label), which inflated OOF to ~0.99 and
-  collapsed on the LB.
-
-Empirically verified before building (on the *hardest* night regime):
-  raw d48_exact -> d49           R2 = 0.493
-  d48_exact + per-gh residual    R2 = 0.897   (leave-one-mod-out)
-At the easier daytime test mods the d48 anchor is far stronger (R2 0.90-0.96),
-so the model has real headroom above the night-hour OOF it is validated on.
-
-Pipeline
---------
-  1. Parse temporal structure (day, mod = minute-of-day).
-  2. Leakage-free feature engineering anchored on the full day-48 history.
-  3. KFold OOF training on d49 rows: LightGBM (raw / log1p / pure) + sklearn
-     HistGradientBoosting + ExtraTrees + Ridge. XGBoost/CatBoost added if present.
-  4. Non-negative ridge meta-blend over OOF predictions, with a grid-search and
-     best-single fallback (whichever wins on honest OOF).
-  5. Clip to [0,1], write the 41778x2 submission.
+So this version does NOT change the winning recipe's feature set. It keeps the
+baseline's exact, leak-free features and adds only what is mathematically safe and
+almost always helps R²: **variance reduction via seed-bagging + model diversity**
+(3-seed LightGBM + HistGradientBoosting + ExtraTrees, simple average). No new
+leak-prone features, no training-population change.
 
 Evaluation: score = max(0, 100 * r2_score(actual, predicted))
 """
-
 from __future__ import annotations
 
 import time
@@ -47,29 +31,12 @@ import pandas as pd
 import pygeohash as pgh
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
-from sklearn.neighbors import BallTree
 from sklearn.ensemble import HistGradientBoostingRegressor, ExtraTreesRegressor
-from sklearn.linear_model import Ridge
 
 import lightgbm as lgb
 
-# Optional boosters — used only if importable.
-try:
-    import xgboost as xgb
-    HAVE_XGB = True
-except Exception:
-    HAVE_XGB = False
-try:
-    from catboost import CatBoostRegressor
-    HAVE_CB = True
-except Exception:
-    HAVE_CB = False
-
 warnings.filterwarnings("ignore")
 
-# ----------------------------------------------------------------------------- #
-# Config
-# ----------------------------------------------------------------------------- #
 PROJECT_ROOT = Path("/home/runtime-terror/Desktop/Github/GridLock")
 TRAIN_PATH = PROJECT_ROOT / "train.csv"
 TEST_PATH = PROJECT_ROOT / "test.csv"
@@ -78,7 +45,7 @@ SUBMISSION_PATH = PROJECT_ROOT / "submission.csv"
 
 N_FOLDS = 5
 SEED = 42
-DELTAS = (15, 30, 45, 60, 90, 120, 180, 240)  # +/- minute offsets for d48 lookups
+LGB_SEEDS = (42, 7, 2024)   # seed-bagging for variance reduction
 
 
 def hbar(title: str = "") -> None:
@@ -86,33 +53,15 @@ def hbar(title: str = "") -> None:
     print(f"\n{line}\n  {title}\n{line}" if title else line)
 
 
-# ----------------------------------------------------------------------------- #
-# 1. Load & temporal parse
-# ----------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Feature engineering — IDENTICAL to the proven baseline (leak-free)
+# --------------------------------------------------------------------------- #
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    train = pd.read_csv(TRAIN_PATH)
-    test = pd.read_csv(TEST_PATH)
-    return train, test
+    return pd.read_csv(TRAIN_PATH), pd.read_csv(TEST_PATH)
 
 
-def parse_time(df: pd.DataFrame) -> pd.DataFrame:
-    parts = df["timestamp"].str.split(":", expand=True)
-    df["hour"] = parts[0].astype(int)
-    df["minute"] = parts[1].astype(int)
-    df["mod"] = df["hour"] * 60 + df["minute"]   # minute-of-day, 15-min grid
-    rad = 2 * np.pi * df["mod"] / 1440.0
-    df["mod_sin"] = np.sin(rad)
-    df["mod_cos"] = np.cos(rad)
-    df["is_night"] = ((df["hour"] >= 22) | (df["hour"] <= 5)).astype(int)
-    df["is_rush"] = (df["hour"].between(7, 10) | df["hour"].between(17, 20)).astype(int)
-    return df
-
-
-# ----------------------------------------------------------------------------- #
-# 2. Geohash decode (lat/lon) with cache
-# ----------------------------------------------------------------------------- #
-def decode_geohashes(gh_series: pd.Series, cache: dict) -> tuple[np.ndarray, np.ndarray]:
-    def _dec(gh):
+def decode_geohashes(df: pd.DataFrame, cache: dict) -> pd.DataFrame:
+    def _dec(gh: str):
         if gh in cache:
             return cache[gh]
         try:
@@ -126,478 +75,203 @@ def decode_geohashes(gh_series: pd.Series, cache: dict) -> tuple[np.ndarray, np.
         cache[gh] = (lat, lon)
         return lat, lon
 
-    out = gh_series.map(_dec)
-    return out.map(lambda x: x[0]).values, out.map(lambda x: x[1]).values
+    out = df["geohash"].map(_dec)
+    df["lat"] = out.map(lambda x: x[0])
+    df["lon"] = out.map(lambda x: x[1])
+    return df
 
 
-# ----------------------------------------------------------------------------- #
-# 3. d48-anchored feature engineering (leakage-free for d49/test rows)
-# ----------------------------------------------------------------------------- #
-def build_d48_structures(d48: pd.DataFrame):
-    """Lookup tables built ONLY from day-48 — clean to use as features for any
-    d49 / test row (a different day)."""
-    exact = d48.groupby(["geohash", "mod"])["demand"].mean()           # (gh,mod) -> demand
-    exact_map = exact.to_dict()
-
-    # Per-geohash full-day d48 trajectory (sorted) for interpolation fill.
-    traj = {}
-    for gh, g in d48.groupby("geohash"):
-        gg = g.sort_values("mod")
-        traj[gh] = (gg["mod"].values.astype(float), gg["demand"].values.astype(float))
-
-    gh_stats = d48.groupby("geohash")["demand"].agg(
-        gh_mean="mean", gh_std="std", gh_max="max", gh_min="min", gh_median="median"
-    )
-    gh_hour = d48.groupby(["geohash", "hour"])["demand"].mean()
-    mod_mean = d48.groupby("mod")["demand"].mean()
-    mod_std = d48.groupby("mod")["demand"].std()
-
-    return dict(exact=exact_map, traj=traj, gh_stats=gh_stats,
-                gh_hour=gh_hour.to_dict(), mod_mean=mod_mean.to_dict(),
-                mod_std=mod_std.to_dict())
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    parts = df["timestamp"].str.split(":", expand=True)
+    df["hour"] = parts[0].astype(int)
+    df["minute"] = parts[1].astype(int)
+    df["minute_of_day"] = df["hour"] * 60 + df["minute"]
+    rad = 2 * np.pi * df["minute_of_day"] / (24 * 60)
+    df["tod_sin"], df["tod_cos"] = np.sin(rad), np.cos(rad)
+    h_rad = 2 * np.pi * df["hour"] / 24
+    df["hour_sin"], df["hour_cos"] = np.sin(h_rad), np.cos(h_rad)
+    df["dow"] = df["day"] % 7
+    dow_rad = 2 * np.pi * df["dow"] / 7
+    df["dow_sin"], df["dow_cos"] = np.sin(dow_rad), np.cos(dow_rad)
+    df["tod_bucket"] = pd.cut(df["hour"], bins=[-1, 5, 11, 16, 20, 23],
+                              labels=[0, 1, 2, 3, 4]).astype(int)
+    df["is_rush"] = (df["hour"].between(7, 10) | df["hour"].between(17, 20)).astype(int)
+    df["is_night"] = ((df["hour"] >= 22) | (df["hour"] <= 5)).astype(int)
+    df["global_minute"] = df["day"] * 1440 + df["minute_of_day"]
+    return df
 
 
-def d48_reliability_table(d48: pd.DataFrame) -> dict:
-    """Lag-15 autocorrelation R^2 within d48 at each mod slot — a proxy for how
-    trustworthy the d48 exact lookup is at that time of day."""
-    piv = d48.pivot_table(index="geohash", columns="mod", values="demand")
-    mods = sorted(d48["mod"].unique())
-    rel = {}
-    for i, m in enumerate(mods):
-        if i == 0:
-            rel[m] = np.nan
-            continue
-        prev = mods[i - 1]
-        a, b = piv[prev], piv[m]
-        ok = a.notna() & b.notna()
-        if ok.sum() > 30:
-            try:
-                rel[m] = max(0.0, r2_score(b[ok], a[ok]))
-            except Exception:
-                rel[m] = np.nan
-        else:
-            rel[m] = np.nan
-    # fill NaN with median
-    med = np.nanmedian(list(rel.values()))
-    return {m: (v if not np.isnan(v) else med) for m, v in rel.items()}, med
+def encode_categoricals(train, test):
+    cat_cols = ["RoadType", "LargeVehicles", "Landmarks", "Weather"]
+    cat_names: list[str] = []
+    for col in cat_cols:
+        combined = pd.concat([train[col], test[col]], axis=0).fillna("__NA__")
+        codes, _ = pd.factorize(combined.astype(str))
+        train[col + "_enc"] = codes[: len(train)]
+        test[col + "_enc"] = codes[len(train):]
+        cat_names.append(col + "_enc")
+    combined_gh = pd.concat([train["geohash"], test["geohash"]], axis=0)
+    gh_codes, _ = pd.factorize(combined_gh.astype(str))
+    train["geohash_enc"] = gh_codes[: len(train)]
+    test["geohash_enc"] = gh_codes[len(train):]
+    cat_names.append("geohash_enc")
+    for plen in (3, 4, 5):
+        col = f"geohash_p{plen}"
+        combined_p = pd.concat([train["geohash"].str[:plen], test["geohash"].str[:plen]], axis=0)
+        p_codes, _ = pd.factorize(combined_p.astype(str))
+        train[col + "_enc"] = p_codes[: len(train)]
+        test[col + "_enc"] = p_codes[len(train):]
+        cat_names.append(col + "_enc")
+    return train, test, cat_names
 
 
-def interp_d48(traj: dict, gh: str, mod: int) -> float:
-    """Linear interpolation of the geohash's d48 trajectory at `mod`. NaN if the
-    geohash is absent from d48."""
-    t = traj.get(gh)
-    if t is None:
-        return np.nan
-    xs, ys = t
-    if len(xs) == 0:
-        return np.nan
-    return float(np.interp(mod, xs, ys))
+def add_geohash_aggregates(train, test):
+    g_stats = train.groupby("geohash").agg(
+        gh_lanes_mean=("NumberofLanes", "mean"), gh_temp_mean=("Temperature", "mean")).reset_index()
+    g_stats_test = test.groupby("geohash").agg(
+        gh_lanes_mean_t=("NumberofLanes", "mean"), gh_temp_mean_t=("Temperature", "mean")).reset_index()
+    merged = pd.merge(g_stats, g_stats_test, on="geohash", how="outer")
+    merged["gh_lanes_mean"] = merged["gh_lanes_mean"].fillna(merged["gh_lanes_mean_t"])
+    merged["gh_temp_mean"] = merged["gh_temp_mean"].fillna(merged["gh_temp_mean_t"])
+    merged = merged[["geohash", "gh_lanes_mean", "gh_temp_mean"]]
+    return train.merge(merged, on="geohash", how="left"), test.merge(merged, on="geohash", how="left")
 
 
-def make_features(df: pd.DataFrame, S: dict, rel_table: dict, rel_med: float,
-                  prefix_aggs: dict) -> pd.DataFrame:
-    """Build the model feature frame for a set of rows using day-48 structures."""
-    n = len(df)
-    gh = df["geohash"].values
-    mod = df["mod"].values.astype(int)
-    hour = df["hour"].values.astype(int)
-    exact = S["exact"]
-    traj = S["traj"]
-
-    feat = pd.DataFrame(index=df.index)
-
-    # --- d48 exact lookup + interpolation fill + missing flag ---
-    d48_exact = np.array([exact.get((g, m), np.nan) for g, m in zip(gh, mod)])
-    d48_interp = np.array([interp_d48(traj, g, m) for g, m in zip(gh, mod)])
-    feat["d48_exact_raw"] = d48_exact
-    feat["d48_missing"] = np.isnan(d48_exact).astype(int)
-    feat["d48_anchor"] = np.where(np.isnan(d48_exact), d48_interp, d48_exact)
-
-    # --- temporal delta lookups (exact preferred, interp fallback) ---
-    for d in DELTAS:
-        for sign, tag in ((+1, "p"), (-1, "m")):
-            mm = mod + sign * d
-            vals = np.array([
-                exact.get((g, int(x)), np.nan) if 0 <= x <= 1425 else np.nan
-                for g, x in zip(gh, mm)
-            ])
-            interp = np.array([interp_d48(traj, g, int(x)) for g, x in zip(gh, mm)])
-            feat[f"d48_{tag}{d}"] = np.where(np.isnan(vals), interp, vals)
-
-    # --- temporal shape: slope & curvature around the slot from interp ---
-    a15p = np.array([interp_d48(traj, g, int(m) + 15) for g, m in zip(gh, mod)])
-    a15m = np.array([interp_d48(traj, g, int(m) - 15) for g, m in zip(gh, mod)])
-    feat["d48_slope"] = (a15p - a15m) / 2.0
-    feat["d48_accel"] = a15p + a15m - 2 * feat["d48_anchor"].values
-
-    # --- per-geohash full-day stats ---
-    gs = S["gh_stats"]
-    for c in ["gh_mean", "gh_std", "gh_max", "gh_min", "gh_median"]:
-        feat[c] = df["geohash"].map(gs[c]).values
-    feat["gh_cv"] = feat["gh_std"] / (feat["gh_mean"] + 1e-6)
-
-    # --- per-(geohash,hour) ---
-    ghh = S["gh_hour"]
-    feat["gh_hour_mean"] = np.array([ghh.get((g, h), np.nan) for g, h in zip(gh, hour)])
-
-    # --- global time-of-day profile ---
-    feat["mod_mean"] = np.array([S["mod_mean"].get(m, np.nan) for m in mod])
-    feat["mod_std"] = np.array([S["mod_std"].get(m, np.nan) for m in mod])
-
-    # --- ratios (shape, not level) ---
-    feat["d48_ratio_mod"] = feat["d48_anchor"] / (feat["mod_mean"] + 1e-6)
-    feat["d48_ratio_gh"] = feat["d48_anchor"] / (feat["gh_mean"] + 1e-6)
-    feat["profile"] = feat["gh_hour_mean"] / (feat["gh_mean"] + 1e-6)
-
-    # --- d48 reliability at this mod + interaction ---
-    feat["d48_reliability"] = np.array([rel_table.get(m, rel_med) for m in mod])
-    feat["d48_x_rel"] = feat["d48_anchor"] * feat["d48_reliability"]
-
-    # --- spatial prefix aggregates (p4/p5) at (prefix,mod) and (prefix,hour) ---
-    for plen in (4, 5):
-        pcol = df["geohash"].str[:plen]
-        pm = prefix_aggs[(plen, "mod")]
-        ph = prefix_aggs[(plen, "hour")]
-        feat[f"p{plen}_mod_mean"] = [pm.get((p, m), np.nan) for p, m in zip(pcol.values, mod)]
-        feat[f"p{plen}_hour_mean"] = [ph.get((p, h), np.nan) for p, h in zip(pcol.values, hour)]
-
-    # --- structural / contextual numerics ---
-    feat["NumberofLanes"] = df["NumberofLanes"].values
-    feat["Temperature"] = df["Temperature"].values
-    feat["lat"] = df["lat"].values
-    feat["lon"] = df["lon"].values
-    feat["hour"] = hour
-    feat["mod"] = mod
-    feat["mod_sin"] = df["mod_sin"].values
-    feat["mod_cos"] = df["mod_cos"].values
-    feat["is_night"] = df["is_night"].values
-    feat["is_rush"] = df["is_rush"].values
-
-    return feat
+def add_interactions(df):
+    df["lanes_x_rush"] = df["NumberofLanes"] * df["is_rush"]
+    df["lanes_x_landmarks"] = df["NumberofLanes"] * (df["Landmarks_enc"] >= 0).astype(int)
+    df["temp_x_rush"] = df["Temperature"].fillna(df["Temperature"].median()) * df["is_rush"]
+    df["lat_x_lon"] = df["lat"] * df["lon"]
+    return df
 
 
-def add_spatial_nn(train_feat, test_feat, d48, train_df, test_df, k=6):
-    """IDW-weighted demand of k nearest d48 geohashes (by haversine on lat/lon)."""
-    centroids = d48.groupby("geohash").agg(lat=("lat", "first"), lon=("lon", "first"),
-                                           dem=("demand", "mean")).dropna()
-    pts = np.radians(centroids[["lat", "lon"]].values)
-    dem = centroids["dem"].values
-    tree = BallTree(pts, metric="haversine")
-
-    def query(df_, feat_):
-        q = np.radians(df_[["lat", "lon"]].values)
-        ok = ~np.isnan(q).any(axis=1)
-        nn_mean = np.full(len(df_), np.nan)
-        nn_idw = np.full(len(df_), np.nan)
-        if ok.sum():
-            dist, idx = tree.query(q[ok], k=min(k, len(dem)))
-            w = 1.0 / (dist + 1e-6)
-            vals = dem[idx]
-            nn_mean[ok] = vals.mean(axis=1)
-            nn_idw[ok] = (vals * w).sum(axis=1) / w.sum(axis=1)
-        feat_["nn_mean"] = nn_mean
-        feat_["nn_idw"] = nn_idw
-
-    query(train_df, train_feat)
-    query(test_df, test_feat)
+def oof_target_encode(train, test, target_col, keys, n_splits=5, smoothing=20.0, seed=SEED):
+    """Out-of-fold target encoding — ONLY for high-count keys (geohash + prefixes).
+    Deliberately excludes geohash×time keys, which leak (≈1 row/cell)."""
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    global_mean = train[target_col].mean()
+    new_cols: list[str] = []
+    for key in keys:
+        feat = f"te_{key}"
+        train[feat] = np.nan
+        for _, (tr_idx, val_idx) in enumerate(kf.split(train)):
+            stats = train.iloc[tr_idx].groupby(key)[target_col].agg(["mean", "count"])
+            sm = (stats["mean"] * stats["count"] + global_mean * smoothing) / (stats["count"] + smoothing)
+            train.loc[train.index[val_idx], feat] = train.iloc[val_idx][key].map(sm).values
+        train[feat] = train[feat].fillna(global_mean)
+        stats_full = train.groupby(key)[target_col].agg(["mean", "count"])
+        sm_full = (stats_full["mean"] * stats_full["count"] + global_mean * smoothing) / (stats_full["count"] + smoothing)
+        test[feat] = test[key].map(sm_full).fillna(global_mean)
+        new_cols.append(feat)
+    return train, test, new_cols
 
 
-# ----------------------------------------------------------------------------- #
-# 4. OOF features that depend on the d49 target (computed without leakage)
-# ----------------------------------------------------------------------------- #
-def add_oof_residual(d49: pd.DataFrame, test_feat, test_df, d49_feat,
-                     folds, S):
-    """gh_d49_resid = per-geohash mean of (d49_night - d48_exact_at_same_mod).
+# --------------------------------------------------------------------------- #
+# Ensemble — KFold, seed-bagged LGB + HistGB + ExtraTrees (variance reduction)
+# --------------------------------------------------------------------------- #
+def train_ensemble(X, y, X_test, cat_features, n_splits=N_FOLDS, seed=SEED):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof = np.zeros(len(X))
+    test_pred = np.zeros(len(X_test))
+    n_members = (len(LGB_SEEDS) + 2)            # LGB seeds + HistGB + ExtraTrees
+    Xf = X.fillna(X.median()); Xtf = X_test.fillna(X.median())
 
-    For d49 TRAIN rows it must be out-of-fold (exclude the row's own fold) to
-    avoid leakage. For TEST rows the full d49-night estimate is used (test is a
-    disjoint daytime population, so no leakage)."""
-    exact = S["exact"]
-    gh = d49["geohash"].values
-    mod = d49["mod"].values.astype(int)
-    d48e = np.array([exact.get((g, m), np.nan) for g, m in zip(gh, mod)])
-    resid = d49["demand"].values - d48e          # NaN where no d48 match
+    lgb_base = dict(objective="regression", metric="rmse", num_leaves=127, max_depth=-1,
+                    min_data_in_leaf=20, feature_fraction=0.85, bagging_fraction=0.85,
+                    bagging_freq=1, lambda_l1=0.0, lambda_l2=0.1, verbose=-1, n_jobs=-1)
 
-    # global & per-roadtype residual fallbacks (full d49-night)
-    glob = np.nanmean(resid)
-    rt = d49["RoadType"].fillna("__NA__").values
-    rt_resid = {}
-    for r in np.unique(rt):
-        m = (rt == r) & ~np.isnan(resid)
-        rt_resid[r] = np.nanmean(resid[m]) if m.sum() else glob
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X), 1):
+        t0 = time.time()
+        val_members = np.zeros((len(val_idx), n_members))
+        test_members = np.zeros((len(X_test), n_members))
+        mi = 0
+        # seed-bagged LightGBM
+        for sd in LGB_SEEDS:
+            p = dict(lgb_base, learning_rate=0.03, seed=sd,
+                     feature_fraction=0.8 if sd != 42 else 0.85)
+            dtr = lgb.Dataset(X.iloc[tr_idx], label=y[tr_idx], categorical_feature=cat_features)
+            dva = lgb.Dataset(X.iloc[val_idx], label=y[val_idx], categorical_feature=cat_features, reference=dtr)
+            m = lgb.train(p, dtr, num_boost_round=4000, valid_sets=[dva],
+                          callbacks=[lgb.early_stopping(150, verbose=False), lgb.log_evaluation(0)])
+            val_members[:, mi] = m.predict(X.iloc[val_idx], num_iteration=m.best_iteration)
+            test_members[:, mi] = m.predict(X_test, num_iteration=m.best_iteration)
+            mi += 1
+        # HistGradientBoosting
+        h = HistGradientBoostingRegressor(max_iter=600, learning_rate=0.04, max_leaf_nodes=63,
+                                          min_samples_leaf=20, l2_regularization=0.1, random_state=seed)
+        h.fit(Xf.iloc[tr_idx], y[tr_idx])
+        val_members[:, mi] = h.predict(Xf.iloc[val_idx]); test_members[:, mi] = h.predict(Xtf); mi += 1
+        # ExtraTrees
+        e = ExtraTreesRegressor(n_estimators=400, min_samples_leaf=5, n_jobs=-1, random_state=seed)
+        e.fit(Xf.iloc[tr_idx], y[tr_idx])
+        val_members[:, mi] = e.predict(Xf.iloc[val_idx]); test_members[:, mi] = e.predict(Xtf); mi += 1
 
-    # OOF per-geohash residual for d49 train
-    oof_gh_resid = np.full(len(d49), np.nan)
-    for tr_idx, va_idx in folds:
-        sub = pd.DataFrame({"gh": gh[tr_idx], "r": resid[tr_idx]}).dropna()
-        gmean = sub.groupby("gh")["r"].mean()
-        oof_gh_resid[va_idx] = pd.Series(gh[va_idx]).map(gmean).values
-    # fallback fill: roadtype then global
-    rt_fill = np.array([rt_resid.get(r, glob) for r in rt])
-    oof_gh_resid = np.where(np.isnan(oof_gh_resid), rt_fill, oof_gh_resid)
-    d49_feat["gh_d49_resid"] = oof_gh_resid
-    d49_feat["rt_d49_resid"] = rt_fill
-
-    # full-data per-geohash residual for TEST
-    full = pd.DataFrame({"gh": gh, "r": resid}).dropna()
-    gmean_full = full.groupby("gh")["r"].mean()
-    test_gh = test_df["geohash"].values
-    test_rt = test_df["RoadType"].fillna("__NA__").values
-    test_rt_fill = np.array([rt_resid.get(r, glob) for r in test_rt])
-    test_resid = pd.Series(test_gh).map(gmean_full).values
-    test_resid = np.where(np.isnan(test_resid), test_rt_fill, test_resid)
-    test_feat["gh_d49_resid"] = test_resid
-    test_feat["rt_d49_resid"] = test_rt_fill
-
-    return glob
-
-
-def add_oof_target_encoding(d49, test_feat, test_df, d49_feat, folds,
-                            keys, smoothing=10.0):
-    """OOF target encoding of d49 demand over categorical keys (d49 train),
-    full-train encoding for test."""
-    y = d49["demand"].values
-    gmean = y.mean()
-    for key, getter in keys:
-        col = f"te_{key}"
-        tr_key = getter(d49)
-        oof = np.full(len(d49), np.nan)
-        for tr_idx, va_idx in folds:
-            sub = pd.DataFrame({"k": tr_key[tr_idx], "y": y[tr_idx]})
-            agg = sub.groupby("k")["y"].agg(["mean", "count"])
-            sm = (agg["mean"] * agg["count"] + gmean * smoothing) / (agg["count"] + smoothing)
-            oof[va_idx] = pd.Series(tr_key[va_idx]).map(sm).values
-        d49_feat[col] = np.where(np.isnan(oof), gmean, oof)
-
-        full = pd.DataFrame({"k": tr_key, "y": y})
-        agg = full.groupby("k")["y"].agg(["mean", "count"])
-        sm = (agg["mean"] * agg["count"] + gmean * smoothing) / (agg["count"] + smoothing)
-        te_key = getter(test_df)
-        test_feat[col] = pd.Series(te_key).map(sm).fillna(gmean).values
-
-
-# ----------------------------------------------------------------------------- #
-# 5. Models — KFold OOF on d49 rows
-# ----------------------------------------------------------------------------- #
-def lgb_oof(X, y, Xt, folds, params, log_target=False, name="lgb"):
-    oof = np.zeros(len(X)); test_pred = np.zeros(len(Xt))
-    for f, (tr, va) in enumerate(folds, 1):
-        ytr = np.log1p(y[tr]) if log_target else y[tr]
-        dtr = lgb.Dataset(X.iloc[tr], label=ytr)
-        dva = lgb.Dataset(X.iloc[va],
-                          label=(np.log1p(y[va]) if log_target else y[va]),
-                          reference=dtr)
-        m = lgb.train(params, dtr, num_boost_round=4000,
-                      valid_sets=[dva], valid_names=["v"],
-                      callbacks=[lgb.early_stopping(150, verbose=False),
-                                 lgb.log_evaluation(0)])
-        p = m.predict(X.iloc[va], num_iteration=m.best_iteration)
-        pt = m.predict(Xt, num_iteration=m.best_iteration)
-        if log_target:
-            p = np.expm1(p); pt = np.expm1(pt)
-        oof[va] = p; test_pred += pt / len(folds)
-    print(f"    {name:14s} OOF R2 = {r2_score(y, oof):.5f}")
+        oof[val_idx] = val_members.mean(axis=1)
+        test_pred += test_members.mean(axis=1) / n_splits
+        print(f"  Fold {fold}: R²={r2_score(y[val_idx], oof[val_idx]):.5f}  time={time.time()-t0:.1f}s")
     return oof, test_pred
 
 
-def sk_oof(make_model, X, y, Xt, folds, name, log_target=False):
-    oof = np.zeros(len(X)); test_pred = np.zeros(len(Xt))
-    Xf = X.fillna(X.median()); Xtf = Xt.fillna(X.median())
-    for tr, va in folds:
-        m = make_model()
-        ytr = np.log1p(y[tr]) if log_target else y[tr]
-        m.fit(Xf.iloc[tr], ytr)
-        p = m.predict(Xf.iloc[va]); pt = m.predict(Xtf)
-        if log_target:
-            p = np.expm1(p); pt = np.expm1(pt)
-        oof[va] = p; test_pred += pt / len(folds)
-    print(f"    {name:14s} OOF R2 = {r2_score(y, oof):.5f}")
-    return oof, test_pred
-
-
-# ----------------------------------------------------------------------------- #
-# 6. Main
-# ----------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
 def main() -> None:
-    t0 = time.time()
+    t_start = time.time()
     hbar("Loading data")
     train, test = load_data()
-    train = parse_time(train); test = parse_time(test)
     test_index = test["Index"].copy()
     print(f"train {train.shape}  test {test.shape}")
 
-    # decode lat/lon
+    hbar("Feature engineering (baseline, leak-free)")
     cache: dict = {}
-    train["lat"], train["lon"] = decode_geohashes(train["geohash"], cache)
-    test["lat"], test["lon"] = decode_geohashes(test["geohash"], cache)
+    train = decode_geohashes(train, cache); test = decode_geohashes(test, cache)
+    train = add_time_features(train); test = add_time_features(test)
+    train, test, cat_features = encode_categoricals(train, test)
+    train, test = add_geohash_aggregates(train, test)
+    train = add_interactions(train); test = add_interactions(test)
 
-    d48 = train[train["day"] == 48].copy()
-    d49 = train[train["day"] == 49].copy().reset_index(drop=True)
-    print(f"d48 rows {len(d48)}  d49 rows {len(d49)}  test rows {len(test)}")
+    te_keys = ["geohash"]
+    for p in (3, 4, 5):
+        train[f"geohash_p{p}"] = train["geohash"].str[:p]
+        test[f"geohash_p{p}"] = test["geohash"].str[:p]
+        te_keys.append(f"geohash_p{p}")
+    train, test, te_cols = oof_target_encode(train, test, "demand", te_keys, N_FOLDS, smoothing=20.0)
+    print(f"  target-encoded (high-count only): {te_cols}")
 
-    hbar("Feature engineering (leakage-free, d48-anchored)")
-    S = build_d48_structures(d48)
-    rel_table, rel_med = d48_reliability_table(d48)
-
-    # prefix spatial aggregates from d48
-    prefix_aggs = {}
-    for plen in (4, 5):
-        pc = d48["geohash"].str[:plen]
-        prefix_aggs[(plen, "mod")] = d48.assign(p=pc).groupby(["p", "mod"])["demand"].mean().to_dict()
-        prefix_aggs[(plen, "hour")] = d48.assign(p=pc).groupby(["p", "hour"])["demand"].mean().to_dict()
-
-    d49_feat = make_features(d49, S, rel_table, rel_med, prefix_aggs)
-    test_feat = make_features(test, S, rel_table, rel_med, prefix_aggs)
-    add_spatial_nn(d49_feat, test_feat, d48, d49, test)
-    print(f"  base features: {d49_feat.shape[1]}")
-
-    # CV folds on d49 (shared by every OOF computation & model)
-    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    folds = list(kf.split(d49_feat))
-
-    # OOF residual + target encodings (target-dependent → must be OOF)
-    glob_resid = add_oof_residual(d49, test_feat, test, d49_feat, folds, S)
-    te_keys = [
-        ("geohash", lambda df: df["geohash"].values),
-        ("p5", lambda df: df["geohash"].str[:5].values),
-        ("p4", lambda df: df["geohash"].str[:4].values),
-        ("rt_mod", lambda df: (df["RoadType"].fillna("NA").astype(str) + "_" + df["mod"].astype(str)).values),
-        ("rt", lambda df: df["RoadType"].fillna("NA").astype(str).values),
+    feature_cols = [
+        "NumberofLanes", "Temperature", "lat", "lon", "lat_x_lon",
+        "day", "hour", "minute", "minute_of_day", "global_minute",
+        "tod_sin", "tod_cos", "hour_sin", "hour_cos", "dow", "dow_sin", "dow_cos",
+        "tod_bucket", "is_rush", "is_night",
+        *cat_features,
+        "gh_lanes_mean", "gh_temp_mean",
+        "lanes_x_rush", "lanes_x_landmarks", "temp_x_rush",
+        *te_cols,
     ]
-    add_oof_target_encoding(d49, test_feat, test, d49_feat, folds, te_keys)
-    print(f"  + residual & target-encoding features → total {d49_feat.shape[1]}")
-    print(f"  global d49-d48 residual = {glob_resid:+.4f}")
+    X = train[feature_cols].copy(); X_test = test[feature_cols].copy()
+    y = train["demand"].values.astype(np.float64)
+    for col in ["Temperature", "gh_temp_mean", "temp_x_rush"]:
+        med = X[col].median(); X[col] = X[col].fillna(med); X_test[col] = X_test[col].fillna(med)
+    print(f"  feature matrix: train {X.shape}, test {X_test.shape}  ({len(LGB_SEEDS)}-seed LGB + HistGB + ExtraTrees)")
 
-    # align columns
-    feat_cols = list(d49_feat.columns)
-    test_feat = test_feat[feat_cols]
-    y = d49["demand"].values.astype(np.float64)
+    hbar(f"Training ensemble ({N_FOLDS}-fold CV)")
+    oof, test_pred = train_ensemble(X, y, X_test, cat_features, N_FOLDS, SEED)
+    test_pred = np.clip(test_pred, 0.0, 1.0)
 
-    # quick anchor baselines (sanity)
-    anchor = d49_feat["d48_anchor"].fillna(d49_feat["d48_anchor"].median()).values
-    print(f"  [sanity] d48_anchor-only OOF R2 (night)      = {r2_score(y, anchor):.4f}")
-    ar = np.clip(anchor + d49_feat['gh_d49_resid'].values, 0, 1)
-    print(f"  [sanity] anchor + gh_resid OOF R2 (night)    = {r2_score(y, ar):.4f}")
-
-    hbar("Training models (KFold OOF on d49)")
-    lgb_base = dict(objective="regression", metric="rmse", learning_rate=0.02,
-                    num_leaves=63, min_data_in_leaf=15, feature_fraction=0.8,
-                    bagging_fraction=0.8, bagging_freq=1, lambda_l2=0.2,
-                    verbose=-1, n_jobs=-1, seed=SEED)
-    lgb_deep = dict(lgb_base, num_leaves=127, min_data_in_leaf=10, lambda_l2=0.1)
-
-    oof_list, test_list, names = [], [], []
-
-    o, t = lgb_oof(d49_feat, y, test_feat, folds, lgb_base, name="lgb_raw")
-    oof_list.append(o); test_list.append(t); names.append("lgb_raw")
-
-    o, t = lgb_oof(d49_feat, y, test_feat, folds, lgb_base, log_target=True, name="lgb_log1p")
-    oof_list.append(o); test_list.append(t); names.append("lgb_log1p")
-
-    o, t = lgb_oof(d49_feat, y, test_feat, folds, lgb_deep, name="lgb_deep")
-    oof_list.append(o); test_list.append(t); names.append("lgb_deep")
-
-    o, t = sk_oof(lambda: HistGradientBoostingRegressor(
-        max_iter=600, learning_rate=0.03, max_leaf_nodes=63, l2_regularization=0.1,
-        min_samples_leaf=15, random_state=SEED),
-        d49_feat, y, test_feat, folds, "histgb")
-    oof_list.append(o); test_list.append(t); names.append("histgb")
-
-    o, t = sk_oof(lambda: ExtraTreesRegressor(
-        n_estimators=400, min_samples_leaf=3, n_jobs=-1, random_state=SEED),
-        d49_feat, y, test_feat, folds, "extratrees")
-    oof_list.append(o); test_list.append(t); names.append("extratrees")
-
-    o, t = sk_oof(lambda: Ridge(alpha=5.0), d49_feat, y, test_feat, folds, "ridge")
-    oof_list.append(o); test_list.append(t); names.append("ridge")
-
-    if HAVE_XGB:
-        def xgb_oof():
-            oof = np.zeros(len(d49_feat)); tp = np.zeros(len(test_feat))
-            for tr, va in folds:
-                m = xgb.XGBRegressor(n_estimators=2000, learning_rate=0.02, max_depth=6,
-                                     subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
-                                     n_jobs=-1, random_state=SEED, early_stopping_rounds=150)
-                m.fit(d49_feat.iloc[tr], y[tr],
-                      eval_set=[(d49_feat.iloc[va], y[va])], verbose=False)
-                oof[va] = m.predict(d49_feat.iloc[va]); tp += m.predict(test_feat) / len(folds)
-            print(f"    {'xgb':14s} OOF R2 = {r2_score(y, oof):.5f}")
-            return oof, tp
-        o, t = xgb_oof(); oof_list.append(o); test_list.append(t); names.append("xgb")
-
-    if HAVE_CB:
-        def cb_oof():
-            oof = np.zeros(len(d49_feat)); tp = np.zeros(len(test_feat))
-            Xf = d49_feat.fillna(d49_feat.median()); Xtf = test_feat.fillna(d49_feat.median())
-            for tr, va in folds:
-                m = CatBoostRegressor(iterations=2000, learning_rate=0.02, depth=7,
-                                      l2_leaf_reg=3.0, random_seed=SEED, verbose=0)
-                m.fit(Xf.iloc[tr], y[tr], eval_set=(Xf.iloc[va], y[va]),
-                      early_stopping_rounds=150, use_best_model=True)
-                oof[va] = m.predict(Xf.iloc[va]); tp += m.predict(Xtf) / len(folds)
-            print(f"    {'catboost':14s} OOF R2 = {r2_score(y, oof):.5f}")
-            return oof, tp
-        o, t = cb_oof(); oof_list.append(o); test_list.append(t); names.append("catboost")
-
-    OOF = np.column_stack(oof_list)
-    TEST = np.column_stack(test_list)
-
-    hbar("Meta-blend (honest OOF on d49)")
-    # 1) non-negative ridge stack
-    meta = Ridge(alpha=1.0, positive=True, fit_intercept=True)
-    meta.fit(OOF, y)
-    blend_oof = meta.predict(OOF)
-    blend_test = meta.predict(TEST)
-    r2_stack = r2_score(y, blend_oof)
-    print(f"  ridge-stack OOF R2     = {r2_stack:.5f}  weights={dict(zip(names, np.round(meta.coef_,3)))}")
-
-    # 2) best single
-    singles = {n: r2_score(y, OOF[:, i]) for i, n in enumerate(names)}
-    best_single = max(singles, key=singles.get)
-    r2_single = singles[best_single]
-    print(f"  best single = {best_single} ({r2_single:.5f})")
-
-    # 3) simple mean of the top-3 tree models for robustness
-    tree_idx = [i for i, n in enumerate(names) if n.startswith(("lgb", "histgb", "xgb", "cat"))]
-    mean_oof = OOF[:, tree_idx].mean(axis=1)
-    mean_test = TEST[:, tree_idx].mean(axis=1)
-    r2_mean = r2_score(y, mean_oof)
-    print(f"  tree-mean OOF R2       = {r2_mean:.5f}")
-
-    # choose best strategy on honest OOF
-    cands = {"stack": (r2_stack, blend_test, blend_oof),
-             "single": (r2_single, TEST[:, names.index(best_single)], OOF[:, names.index(best_single)]),
-             "tree_mean": (r2_mean, mean_test, mean_oof)}
-    best = max(cands, key=lambda k: cands[k][0])
-    best_r2, final_test, final_oof = cands[best]
-    print(f"  → selected strategy: {best}  (OOF R2 = {best_r2:.5f})")
-
-    final_test = np.clip(final_test, 0.0, 1.0)
-    final_score = max(0.0, 100.0 * best_r2)
-
-    hbar("Results")
-    print(f"Honest OOF R² (d49)        : {best_r2:.6f}")
-    print(f"Honest OOF score (100·R²)  : {final_score:.4f}")
-    print(f"  test pred  mean={final_test.mean():.4f} std={final_test.std():.4f} "
-          f"min={final_test.min():.4f} max={final_test.max():.4f}")
-    print(f"  d49 train  mean={y.mean():.4f} std={y.std():.4f}")
-
-    hbar("Feature importance (lgb_raw, fold-mean gain)")
-    dtr = lgb.Dataset(d49_feat, label=y)
-    m = lgb.train(lgb_base, dtr, num_boost_round=400, callbacks=[lgb.log_evaluation(0)])
-    fi = pd.Series(m.feature_importance("gain"), index=d49_feat.columns).sort_values(ascending=False)
-    print(fi.head(20).to_string())
+    cv_r2 = r2_score(y, oof)
+    hbar("CV Results")
+    print(f"Overall OOF R²        : {cv_r2:.6f}   (random-KFold — inflated; LB ≈ this minus ~0.04)")
+    print(f"Overall score (100·R²): {max(0.0, 100.0*cv_r2):.4f}")
+    print(f"  test pred mean={test_pred.mean():.4f} std={test_pred.std():.4f} "
+          f"min={test_pred.min():.4f} max={test_pred.max():.4f}")
 
     hbar("Writing submission")
-    sub = pd.DataFrame({"Index": test_index.values, "demand": final_test})
+    sub = pd.DataFrame({"Index": test_index.values, "demand": test_pred})
     sample = pd.read_csv(SAMPLE_SUB_PATH)
-    assert list(sub.columns) == list(sample.columns), \
-        f"col mismatch {list(sub.columns)} vs {list(sample.columns)}"
+    assert list(sub.columns) == list(sample.columns), f"col mismatch {list(sub.columns)}"
     assert sub.shape == (41778, 2), f"bad shape {sub.shape}"
     sub.to_csv(SUBMISSION_PATH, index=False)
     print(f"wrote {SUBMISSION_PATH}  shape={sub.shape}")
     print(sub.head())
-    print(f"\nTotal runtime: {time.time()-t0:.1f}s")
+    print(f"\nTotal runtime: {time.time()-t_start:.1f}s")
 
 
 if __name__ == "__main__":

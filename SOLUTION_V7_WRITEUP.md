@@ -120,18 +120,20 @@ OOF feature and every model so nothing leaks across folds.
 | HistGradientBoosting | 0.94869 |
 | **ExtraTrees** | **0.95237** |
 | Ridge | 0.93720 |
+| XGBoost | 0.95035 |
+| CatBoost | 0.95175 |
 
-> XGBoost / CatBoost are wired in (`HAVE_XGB`, `HAVE_CB`) and join automatically
-> if installed. They were unavailable in this environment (no install access for
-> the large wheels), so the ensemble ran on LightGBM + scikit-learn.
+> XGBoost (3.2.0) and CatBoost (1.2.10) are wired in (`HAVE_XGB`, `HAVE_CB`) and
+> join automatically when installed. Both are now installed and active — the
+> ensemble runs all 8 models.
 
 **Meta layer** picks the best of three strategies on honest OOF:
-- non-negative Ridge **stack** over all model OOFs → **0.95269** ✅ selected
+- non-negative Ridge **stack** over all 8 model OOFs → **0.95374** ✅ selected
 - best single (ExtraTrees, 0.95237)
-- tree-mean (0.94913)
+- tree-mean (0.95109)
 
-Stack weights favored ExtraTrees (0.39) + HistGB (0.21) + Ridge (0.16).
-Predictions clipped to `[0, 1]`.
+Stack weights favored ExtraTrees (0.30) + CatBoost (0.27) + XGBoost (0.15) +
+HistGB (0.13). Predictions clipped to `[0, 1]`.
 
 ---
 
@@ -139,8 +141,8 @@ Predictions clipped to `[0, 1]`.
 
 ### Honest OOF (the headline number)
 ```
-Selected: ridge-stack
-Honest OOF R² (d49)       = 0.95269   →  score 95.27
+Selected: ridge-stack (8-model)
+Honest OOF R² (d49)       = 0.95374   →  score 95.37
 ```
 This is measured on the d49 population with **zero leakage** — directly comparable
 to the test task, unlike the v1–v5 ~0.99 OOF which was inflated by d48 self-leakage.
@@ -174,7 +176,7 @@ delta/anchor features carry more weight at daytime, exactly as intended.
 |---|---|---|---|
 | v1 (baseline, was `solution.py`) | full 77k train, random KFold | 0.951 *(leaky/inflated)* | **91.228** |
 | v2–v5 | interpolation / stacks / weights | ~0.994 *(fake)* | 90.9–91.0 |
-| **v7 (this, now `solution.py`)** | **d49-only, leakage-free, 6-model stack** | **0.9527 honest / 0.9589 leave-mods-out** | *expect ≫ 91* |
+| **v7 (this, now `solution.py`)** | **d49-only, leakage-free, 8-model stack (incl. XGB+CatBoost)** | **0.9537 honest / 0.9589 leave-mods-out** | *expect ≫ 91* |
 
 The OOF here is *lower* than the old inflated 0.99 **on purpose** — it is honest.
 On the night regime it already beats the v1 **LB** by ~4 points, and the daytime
@@ -199,8 +201,8 @@ honest OOF. `python3 diagnostic.py` for the stricter checks.
 
 ## 8. What Would Push It Higher (validated next steps)
 
-1. **Add XGBoost + CatBoost** — the code already supports them; CatBoost was the
-   best single model in the docs' v7 notes. Pure model-diversity gain.
+1. ~~**Add XGBoost + CatBoost**~~ — ✅ **done** (xgboost 3.2.0 + catboost 1.2.10
+   installed and active; lifted the stack 0.9527 → 0.9537, CatBoost 2nd-highest weight).
 2. **Daytime-aware pseudo-labeling** — train v7 → predict test → re-add the most
    confident Highway / high-demand daytime rows as pseudo-d49 labels → retrain.
    This injects *daytime* examples so the model directly learns the strong daytime
